@@ -1,0 +1,12 @@
+Verified runtime baseline
+=========================
+
+Python: 3.10
+PyTorch: 1.13.1
+Torchvision: 0.14.1
+Torchaudio: 0.13.1
+CUDA toolkit: 11.6 (or a driver-compatible build)
+
+Install Python packages from requirements.txt and build the local CUDA
+extensions in submodules/3dgs-pose and submodules/simple-knn. This file is a
+portable baseline, not a machine-specific pip freeze.

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pending
+outputs/runs/
+*.log
+*.launcher.log
+*.pth
+*.ply
+events.out.tfevents.*
+outputs/*
+!outputs/.gitkeep
+build/
+*.egg-info/

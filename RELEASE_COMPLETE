@@ -1,0 +1,9 @@
+{
+  "status": "PASS",
+  "protocol": "strict_v2_source_release",
+  "repository": "E-D3DGS-RGBT",
+  "generated_from": "ED3DGS-RGBT-TIME8.22",
+  "outputs_included": false,
+  "teacher_artifacts_included": false,
+  "source_manifest": "MANIFEST.sha256"
+}
