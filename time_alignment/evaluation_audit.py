@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 
 from time_alignment import schedule
+from time_alignment.reference_contract import reference_valid
 
 
 METRICS = ("PSNR", "SSIM", "LPIPS_VGG", "LPIPS_ALEX")
@@ -66,27 +67,10 @@ if (support_count <= 0 or len(support_names) != support_count
 baseline = (
     json.loads(args.baseline_gate.read_text())
     if args.baseline_gate is not None else None)
-baseline_checks = (baseline or {}).get("checks") or {}
-baseline_ignored_checks = {"clock_accuracy", "profile_consistency"}
-baseline_valid = (
-    baseline is not None
-    and baseline.get("schema") == "covers_self_calibrating_global_clock_gate"
-    and baseline.get("mechanical") is False
-    and baseline.get("expected_shift_frames") == 0
-    and bool(baseline.get("strict_scene_freeze"))
-    == bool(args.strict_scene_freeze)
-    and bool(baseline.get("strict_step_budget_v2"))
-    == strict_step_budget_v2
-    and (not strict_step_budget_v2
-         or (baseline.get("expected_calibration_steps")
-             == strict_counts["calibration"]
-             and baseline.get("expected_scene_steps")
-             == strict_counts["scene"]))
-    and baseline.get("support_contract_sha256") == sha256(args.support_contract)
-    and math.isfinite(float(baseline.get("final_offset_frames")))
-    and set(baseline_checks) >= baseline_ignored_checks
-    and all(value is True for name, value in baseline_checks.items()
-            if name not in baseline_ignored_checks))
+model_file = Path(args.model_manifest.read_text().splitlines()[0].split(maxsplit=1)[1].lstrip(' *'))
+training = json.loads((model_file.parents[2] / 'training_result.json').read_text())
+baseline_valid = reference_valid(baseline, sha256(args.support_contract),
+                                training['teacher_hashes_before']['deformation.pth'])
 if baseline is not None and not baseline_valid:
     raise RuntimeError("Invalid zero-shift baseline Gate")
 baseline_offset = (
@@ -105,6 +89,12 @@ if (contract.get("synthetic_test_shift_frames") != args.expected_shift
         or contract.get("test_time_pose_or_fov_optimization")):
     raise RuntimeError("Evaluation protocol mismatch")
 time_enabled = args.arm in {"time_only", "full"}
+if (contract.get('method') != f'ours_{args.expected_iteration}'
+        or contract.get('thermal_pose_enabled') != (args.arm in {'pose_only','full'})
+        or contract.get('test_cameras_temporal_enabled') != time_enabled
+        or training.get('arm') != args.arm
+        or training.get('iterations') != args.expected_iteration):
+    raise RuntimeError('Evaluation model iteration/arm mismatch')
 expected_offset = float(contract["applied_offset_frames"])
 target_offset = float(args.expected_shift) + baseline_offset
 offset_ok = (

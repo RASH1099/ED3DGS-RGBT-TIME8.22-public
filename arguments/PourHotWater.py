@@ -140,7 +140,9 @@ OptimizationParams = dict(
     temporal_offset_max_frames=24.0,
     temporal_offset_start_iter=1,
     temporal_offset_freeze_after=(
-        CLOCK_FREEZE_AFTER if JOINT_CLOCK else -1),
+        CLOCK_FREEZE_AFTER if JOINT_CLOCK and not STRICT_STEP_BUDGET_V2 else -1),
+    temporal_offset_target_steps=(
+        STRICT_CALIBRATION_STEPS if STRICT_STEP_BUDGET_V2 else -1),
     temporal_offset_force_frames=None,
     temporal_offset_prior_weight=0.0,
     temporal_strict_common_support=True,

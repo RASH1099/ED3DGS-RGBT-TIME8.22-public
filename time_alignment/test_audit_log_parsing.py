@@ -4,6 +4,14 @@ from time_alignment import ablation_audit, gate_audit, training_audit
 
 
 class AuditLogParsingTest(unittest.TestCase):
+    def test_tqdm_padding_before_freeze_event(self):
+        for padding in ['', '  ', '\t']:
+            log = ('Training progress: 88%| 39470/45000 [pts=154859]'
+                   + padding + 'STRICT_CLOCK_FREEZE {"iteration": 39470}\n')
+            for module in (training_audit, gate_audit):
+                self.assertEqual(module.rows(log, 'STRICT_CLOCK_FREEZE'),
+                                 [{'iteration': 39470}])
+
     def test_rows_accept_tqdm_carriage_return_boundaries(self):
         log = (
             'CLOCK_STEP_NUISANCE_AUDIT {"iteration": 1}\n'

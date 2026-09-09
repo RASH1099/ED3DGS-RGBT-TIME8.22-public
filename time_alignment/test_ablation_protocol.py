@@ -82,6 +82,7 @@ def load_support_function(name):
 
 def check_configuration_matrix():
     cases = {
+        "": ("baseline", False, False, False),
         "fixed_clock": ("pose_only", False, True, False),
         "total_gradient": ("full", True, True, True),
         "frozen_pose": ("time_only", True, False, True),

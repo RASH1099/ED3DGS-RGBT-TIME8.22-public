@@ -50,6 +50,7 @@ All actions use the same entry point. Set the dataset explicitly and keep each o
 export ED3DGS_SCENE=covers
 export ED3DGS_DATASET=/path/to/covers
 export ED3DGS_EXPERIMENT_SHIFT=20
+export ED3DGS_EXPERIMENT_ARM=full
 export ED3DGS_TEACHER_MODEL_PATH=/path/to/artifacts/covers/rgb_teacher
 
 bash run.sh teacher 0 6666
@@ -57,7 +58,7 @@ bash run.sh lifecycle 0 6666
 bash run.sh verify
 ```
 
-For Lab and MeetingRoom scenes, the launcher automatically selects the matching per-scene full and RGB-teacher configurations. Set `ED3DGS_SUPPORT_CONTRACT` when using a generated or externally stored contract. The default formal protocol is strict V2: a 30,000-step reconstruction block plus a 15,000-step calibration block (45,000 outer iterations), with scene variables frozen during calibration. Gate actions use the selected smaller scene-step budget and the same ownership rules. `run.sh` refuses existing output roots and never overwrites a teacher, Gate, or evaluation artifact.
+ED3DGS_EXPERIMENT_ARM accepts aseline, 	ime_only, pose_only, or ull. Set ED3DGS_BASELINE_GATE_REPORT to a registered zero-shift Gate report when an audit should measure the shifted run relative to that reference. For Lab and MeetingRoom scenes, the launcher automatically selects the matching per-scene full and RGB-teacher configurations. Set `ED3DGS_SUPPORT_CONTRACT` when using a generated or externally stored contract. The default formal protocol is strict V2: a 30,000-step reconstruction block plus a 15,000-step calibration block (45,000 outer iterations), with scene variables frozen during calibration. Gate actions use the selected smaller scene-step budget and the same ownership rules. `run.sh` refuses existing output roots and never overwrites a teacher, Gate, or evaluation artifact.
 
 The RGB teacher is trained from scratch for 30,000 iterations with Thermal losses, pose, intrinsics, temporal alignment, and modality updates disabled. Stage 2 starts from a raw-zero clock and consumes only the saved teacher artifact. Formal evaluation is fixed-support, pure forward, and test-time optimization is disabled.
 

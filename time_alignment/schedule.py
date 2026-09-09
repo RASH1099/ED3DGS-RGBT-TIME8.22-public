@@ -1,6 +1,35 @@
 """Pure schedule helpers for exact Scene/Gaussian optimizer-step accounting."""
 
 
+def support_switch_iteration(calibration_steps, start_iteration=1):
+    """First iteration after the alternating calibration/reconstruction prefix."""
+    if calibration_steps <= 0 or start_iteration < 1:
+        raise ValueError("invalid support switch budget")
+    return start_iteration + 2 * calibration_steps
+
+
+def freeze_records_valid(records, last_clock_iteration, total_iterations,
+                         clock_steps, final_offset, legacy_status_records=False):
+    """Validate a transition event, or explicitly identified old status logs."""
+    import math
+
+    expected_iterations = (list(range(last_clock_iteration, total_iterations + 1))
+                           if legacy_status_records else [last_clock_iteration])
+    if [row.get("iteration") for row in records] != expected_iterations:
+        return False
+    for row in records:
+        offset = row.get("offset_frames")
+        if (row.get("clock_optimizer_steps") != clock_steps
+                or row.get("requires_grad_next") is not False
+                or not isinstance(offset, (int, float))
+                or not math.isfinite(offset)
+                or not isinstance(final_offset, (int, float))
+                or not math.isfinite(final_offset)
+                or abs(offset - final_offset) > 1e-8):
+            return False
+    return True
+
+
 def should_step_scene(full_scene_steps, optimizer_phase):
     if optimizer_phase not in {
             "calibration", "reconstruction", "scene_tail", "warmup", "joint"}:

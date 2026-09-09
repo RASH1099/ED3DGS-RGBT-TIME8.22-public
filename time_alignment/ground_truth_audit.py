@@ -34,7 +34,11 @@ def main():
     if audit_path.exists():
         raise FileExistsError(f"Refusing existing GT audit: {audit_path}")
 
-    method_root = root / "test" / "ours_30000"
+    render_contract = json.loads((root / "render_contract.json").read_text())
+    method = render_contract.get("method")
+    if not isinstance(method, str) or not re.fullmatch(r"ours_[0-9]+", method):
+        raise RuntimeError("Invalid render method in contract")
+    method_root = root / "test" / method
     rgb_count, rgb_digest = image_manifest(method_root / "test_rgb" / "gt")
     thermal_count, thermal_digest = image_manifest(
         method_root / "test_thermal" / "gt")

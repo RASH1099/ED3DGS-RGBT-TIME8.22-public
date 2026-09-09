@@ -11,6 +11,7 @@ from pathlib import Path
 import torch
 
 from time_alignment import schedule
+from time_alignment.reference_contract import reference_valid
 
 
 MAX_GAUSSIANS = 155000
@@ -25,7 +26,7 @@ def finite(value):
 
 
 def rows(log, name):
-    pattern = (r"(?:^|[\r\n])(?:Training progress:[^\r\n]*\])?"
+    pattern = (r"(?:^|[\r\n])(?:Training progress:[^\r\n]*\][ \t]*)?"
                + re.escape(name) + r" (\{[^\r\n]*\})")
     return [json.loads(match.group(1)) for match in re.finditer(pattern, log)]
 
@@ -81,7 +82,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--log", required=True, type=Path)
     parser.add_argument("--launcher-log", required=True, type=Path)
-    parser.add_argument("--arm", choices=("full", "time_only"),
+    parser.add_argument("--arm", choices=("baseline", "full", "time_only", "pose_only"),
                         default="full")
     parser.add_argument("--expected-shift", required=True, type=float)
     parser.add_argument("--expected-iterations", type=int, default=30000)
@@ -90,6 +91,8 @@ def main():
     parser.add_argument("--support-contract", required=True, type=Path)
     parser.add_argument("--baseline-gate", type=Path)
     parser.add_argument("--strict-scene-freeze", action="store_true")
+    parser.add_argument("--legacy-freeze-status-records", action="store_true",
+                        help="Validate every legacy per-iteration freeze status record")
     args = parser.parse_args()
     expected_shift = float(args.expected_shift)
     expected_iterations = int(args.expected_iterations)
@@ -99,9 +102,15 @@ def main():
             != (args.scene_steps is None)):
         raise RuntimeError(
             "calibration-steps and scene-steps must be provided together")
-    expected_pose = args.arm == "full"
+    expected_time = args.arm in {"full", "time_only"}
+    expected_pose = args.arm in {"full", "pose_only"}
     expected_pose_count = 2 if expected_pose else 0
-    expected_ablation_mode = None if expected_pose else "frozen_pose"
+    expected_ablation_mode = {
+        "baseline": None,
+        "full": None,
+        "time_only": "frozen_pose",
+        "pose_only": "fixed_clock",
+    }[args.arm]
     strict_steps = schedule.strict_block_step_counts(
         expected_iterations,
         calibration_steps=args.calibration_steps,
@@ -109,11 +118,13 @@ def main():
     expected_scene_steps = (
         strict_steps["scene"] if args.strict_scene_freeze else 30000)
     expected_calibration_steps = (
+        0 if args.arm == "baseline" else
         strict_steps["calibration"] if args.strict_scene_freeze else 30000)
     expected_clock_steps = (
         schedule.strict_block_step_counts(15001)["calibration"]
-        if args.strict_scene_freeze else 15000)
-    if strict_step_budget_v2:
+        if args.strict_scene_freeze and expected_time
+        else 15000 if expected_time else 0)
+    if strict_step_budget_v2 and expected_time:
         expected_clock_steps = strict_steps["calibration"]
     expected_last_clock_iteration = expected_iterations
     if args.strict_scene_freeze:
@@ -207,34 +218,8 @@ def main():
     baseline = (
         json.loads(args.baseline_gate.read_text())
         if args.baseline_gate is not None else None)
-    baseline_checks = (baseline or {}).get("checks") or {}
-    baseline_ignored_checks = {"clock_accuracy", "profile_consistency"}
-    baseline_valid = (
-        baseline is not None
-        and baseline.get("schema")
-        == "covers_self_calibrating_global_clock_gate"
-        and baseline.get("mechanical") is False
-        and baseline.get("expected_shift_frames") == 0
-        and bool(baseline.get("strict_scene_freeze"))
-        == bool(args.strict_scene_freeze)
-        and bool(baseline.get("strict_step_budget_v2"))
-        == strict_step_budget_v2
-        and (not strict_step_budget_v2
-             or (baseline.get("expected_calibration_steps")
-                 == strict_steps["calibration"]
-                 and baseline.get("expected_scene_steps")
-                 == strict_steps["scene"]))
-        and baseline.get("support_contract_sha256")
-        == sha256_file(args.support_contract)
-        and baseline.get("teacher_deformation_sha256")
-        == teacher_deformation_hash
-        and finite(baseline.get("final_offset_frames"))
-        and len(baseline.get("final_endpoint_offsets_frames") or []) == 2
-        and all(finite(value) for value in
-                baseline.get("final_endpoint_offsets_frames") or [])
-        and set(baseline_checks) >= baseline_ignored_checks
-        and all(value is True for name, value in baseline_checks.items()
-                if name not in baseline_ignored_checks))
+    baseline_valid = reference_valid(
+        baseline, sha256_file(args.support_contract), teacher_deformation_hash)
 
     latest_route = route[-1] if route else {}
     route_values = [float(latest_route.get(key, -1.0)) for key in (
@@ -254,7 +239,7 @@ def main():
         and point_count is not None and 0 < point_count <= MAX_GAUSSIANS)
     fastpath_ok = (
         len(fastpath) == 1 and fastpath[0] == FASTPATH
-        and contract.get("memory_safe_backward") is False
+        and (not expected_time or contract.get("memory_safe_backward") is False)
         and "MEMORY_SAFE_CACHE_RELEASE" not in log
         and "MEMORY_SAFE_CLOCK_DETACH" not in log)
 
@@ -303,27 +288,27 @@ def main():
         "arm_contract": (
             report.get("arm") == args.arm
             and report.get("ablation_mode") == expected_ablation_mode
-            and report.get("temporal_alignment_enabled") is True
+            and report.get("temporal_alignment_enabled") is expected_time
             and report.get("thermal_pose_enabled") is expected_pose
             and report.get("thermal_pose_unique_rotation_parameters")
             == expected_pose_count
             and report.get("thermal_pose_unique_translation_parameters")
             == expected_pose_count),
         "iterations": report.get("iterations") == expected_iterations,
-        "raw_zero": (
+        "raw_zero": (not expected_time or (
             internal.get("initial_raw") == 0.0
             and internal.get("initial_offset_frames") == 0.0
             and internal.get("initial_drift_raw") == 0.0
             and internal.get("initial_drift_frames") == 0.0
             and internal.get("shift_truth_input") is False
             and internal.get("pretraining_offset_assignment") is False
-            and internal.get("pre_reconstruction_clock_phase") is False),
+            and internal.get("pre_reconstruction_clock_phase") is False)),
         "shift_protocol": (
             report.get("observed_dataset_frame_shift") == expected_shift),
         "teacher_immutable": (
             report.get("teacher_hashes_before")
             == report.get("teacher_hashes_after")),
-        "global_clock": (
+        "global_clock": (not expected_time or (
             report.get("schema")
             == "covers_self_calibrating_global_clock_training_result"
             and report.get("self_calibrating_clock") is True
@@ -331,8 +316,8 @@ def main():
             and internal.get("schema")
             == "self_calibrating_global_clock_contract"
             and internal.get("unified_main_training") is True
-            and internal.get("candidate_enumeration") is False),
-        "clock_observable": (
+            and internal.get("candidate_enumeration") is False)),
+        "clock_observable": (not expected_time or (
             consensus.get("schema")
             == "covers_continuous_global_motion_cost_volume_clock"
             and consensus.get("global_offset_only") is True
@@ -349,9 +334,14 @@ def main():
             and consensus.get("linear_start_iteration") == 301
             and (consensus.get("aggregation") or {}).get("schema")
             == "global_mean_all_supported_transitions"
-            and len(consensus.get("block_profiles") or {}) == 8),
-        "profile_consistency": profile_ok,
-        "gradient_isolation": (
+            and len(consensus.get("block_profiles") or {}) == 8)),
+        "profile_consistency": not expected_time or profile_ok,
+        "gradient_isolation": ((not expected_time and not contract
+                                 and not nuisance
+                                 and counts.get("temporal_offset_optimizer_steps", 0) == 0
+                                 and counts.get("joint_clock_optimizer_steps", 0) == 0)
+                                or (expected_time
+            and
             contract.get("alignment_gradient_owners") == ["scene_clock"]
             and contract.get("reconstruction_backward_excludes_alignment")
             is True
@@ -365,9 +355,22 @@ def main():
                  == {1, expected_last_clock_iteration})
             and all(row.get("parameter_versions_unchanged") is True
                     and int(row.get("nuisance_parameter_count", 0)) > 0
-                    for row in nuisance)),
-        "clock_schedule": (
-            contract.get("enabled") is True
+                    for row in nuisance))),
+        "clock_schedule": ((args.arm == "baseline" and not contract
+                             and not freezes and not strict_freezes
+                             and report.get("temporal_alignment_enabled") is False
+                             and len(switches) == 1
+                             and switches[0].get("iteration") == 0)
+                            or (args.arm != "baseline"
+                                and not expected_time and not contract
+                             and not freezes and not strict_freezes
+                             and report.get("temporal_alignment_enabled") is False
+                             and len(switches) == 1
+                             and switches[0].get("iteration")
+                             == schedule.support_switch_iteration(
+                                 expected_calibration_steps))
+                            or (expected_time
+            and contract.get("enabled") is True
             and contract.get("alignment_loss")
             == "continuous_global_motion_cost_volume"
             and ((not strict_step_budget_v2
@@ -385,22 +388,26 @@ def main():
                   and freezes[0].get("freeze_after_iteration") == 15000
                   and freezes[0].get("requires_grad") is False)
                  or (strict_step_budget_v2
-                     and len(strict_freezes) == 1
-                     and strict_freezes[0].get("clock_optimizer_steps")
-                     == expected_clock_steps))
+                     and schedule.freeze_records_valid(
+                         strict_freezes, expected_last_clock_iteration,
+                         expected_iterations, expected_clock_steps,
+                         report.get("final_offset_frames"),
+                         args.legacy_freeze_status_records)))
             and len(switches) == 1
             and switches[0].get("iteration")
-            == (2 * expected_calibration_steps if strict_step_budget_v2
-                else 15001)),
-        "clock_optimizer": (
+            == (schedule.support_switch_iteration(expected_calibration_steps)
+                if strict_step_budget_v2
+                else 15001))),
+        "clock_optimizer": (not expected_time or (
             counts.get("temporal_offset_optimizer_steps")
             == expected_clock_steps
             and counts.get("joint_clock_nonzero_offset_gradients", 0) > 0
             and counts.get("joint_clock_nonzero_drift_gradients", 0) == 0
-            and internal.get("optimizer_steps") == expected_clock_steps),
-        "clock_accuracy": clock_accuracy,
+            and internal.get("optimizer_steps") == expected_clock_steps)),
+        "clock_accuracy": not expected_time or clock_accuracy,
         "clock_parameter_identity": (
-            report.get("temporal_raw_same_object_end_to_end") is True),
+            not expected_time
+            or report.get("temporal_raw_same_object_end_to_end") is True),
         "route_balanced": route_ok,
         "both_modal_gradients": modal_grad_ok,
         "deformation_trainable": (
@@ -422,7 +429,9 @@ def main():
             report.get("train_camera_count") == expected_calibration_count
             and report.get("reconstruction_camera_count")
             == expected_support_count
-            and support.get("schema") == "covers_blind_global_dual_support"
+            and support.get("schema") == (
+                "covers_blind_global_dual_support"
+                if expected_time else "covers_fixed_clock_dual_support")
             and support.get("calibration_camera_count")
             == expected_calibration_count
             and support.get("reconstruction_camera_count")
@@ -435,7 +444,7 @@ def main():
             == expected_selection_policy
             and support.get("shift_truth_used_for_selection") is False
             and support.get("learned_clock_used_for_selection") is False
-            and support.get("learned_clock_used_for_validity_only") is True
+            and support.get("learned_clock_used_for_validity_only") is expected_time
             and support.get("training_frame_start") == expected_frame_start
             and support.get("training_frame_end_exclusive")
             == expected_frame_end
@@ -452,7 +461,16 @@ def main():
             and len(support_states) == 1
             and support_states[0].get("configured") is False
             and support_states[0].get("current_camera_count")
-            == expected_calibration_count
+            == (0 if args.arm == "baseline" else expected_calibration_count)
+            and (args.arm != "baseline" or (
+                len(switches) == 1
+                and switches[0].get("iteration") == 0
+                and switches[0].get("calibration_camera_count")
+                == expected_calibration_count
+                and switches[0].get("reconstruction_camera_count")
+                == expected_support_count
+                and switches[0].get("fixed_offset_frames") == 0.0
+                and switches[0].get("ablation_mode") is None))
             and support_states[0].get(
                 "expected_reconstruction_camera_count")
             == expected_support_count),
@@ -543,8 +561,11 @@ def main():
         "checks": checks,
         "iterations": report.get("iterations"),
         "strict_step_budget_v2": strict_step_budget_v2,
-        "expected_calibration_steps": strict_steps["calibration"],
-        "expected_scene_steps": strict_steps["scene"],
+        "freeze_log_format": ("legacy_per_iteration_status"
+                              if args.legacy_freeze_status_records
+                              else "single_transition"),
+        "expected_calibration_steps": expected_calibration_steps,
+        "expected_scene_steps": expected_scene_steps,
         "expected_shift_frames": expected_shift,
         "clock_accuracy_mode": (
             "baseline_residual" if baseline is not None else "absolute"),

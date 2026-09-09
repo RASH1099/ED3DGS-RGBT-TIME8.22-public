@@ -38,9 +38,11 @@ case "$STRICT_SCENE_FREEZE" in
 esac
 ARM=${ED3DGS_EXPERIMENT_ARM:-full}
 case "$ARM" in
+  baseline) ABLATION_MODE=; STRICT_SCENE_FREEZE=0 ;;
   full) ABLATION_MODE= ;;
   time_only) ABLATION_MODE=frozen_pose ;;
-  *) echo "Experiment arm must be full or time_only" >&2; exit 3 ;;
+  pose_only) ABLATION_MODE=fixed_clock ;;
+  *) echo "Experiment arm must be baseline, full, time_only, or pose_only" >&2; exit 3 ;;
 esac
 if [[ "$ACTION" == "teacher" || "$ACTION" == "verify" || "$ACTION" == "help" ]]; then
   EXPERIMENT_SHIFT=${ED3DGS_EXPERIMENT_SHIFT:-0}
@@ -89,7 +91,7 @@ require_python() {
 require_gpu_seed() {
   local gpu=$1
   local seed=$2
-  [[ "$gpu" =~ ^[01]$ ]] || { echo "GPU must be 0 or 1" >&2; exit 3; }
+  [[ "$gpu" =~ ^[0-3]$ ]] || { echo "GPU must be in 0..3" >&2; exit 3; }
   [[ "$seed" =~ ^[0-9]+$ ]] || { echo "Seed must be an integer" >&2; exit 3; }
 }
 
@@ -121,6 +123,21 @@ strict_outer_iterations() {
   echo $((scene_steps + calibration_steps))
 }
 
+arm_calibration_steps() {
+  if [[ "$ARM" == "baseline" ]]; then
+    echo 0
+  else
+    strict_calibration_steps "$1"
+  fi
+}
+
+arm_outer_iterations() {
+  local scene_steps=$1
+  local calibration_steps
+  calibration_steps=$(arm_calibration_steps "$scene_steps")
+  echo $((scene_steps + calibration_steps))
+}
+
 verify_code() {
   cd "$ROOT"
   sha256sum --quiet -c MANIFEST.sha256
@@ -131,31 +148,42 @@ configure_training() {
   local scene_steps=$2
   local calibration_steps
   local outer_iterations
-  [[ "$STRICT_SCENE_FREEZE" == "1" ]] || {
+  [[ "$STRICT_SCENE_FREEZE" == "1" || "$ARM" == "baseline" ]] || {
     echo "The final release requires strict scene freeze" >&2
     return 3
   }
-  calibration_steps=$(strict_calibration_steps "$scene_steps")
-  outer_iterations=$((scene_steps + calibration_steps))
+  calibration_steps=$(arm_calibration_steps "$scene_steps")
+  outer_iterations=$(arm_outer_iterations "$scene_steps")
   export CUDA_VISIBLE_DEVICES="$gpu"
   export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-  export PYTHONPATH="$ROOT/submodules/3dgs-pose:$ROOT"
+  export PYTHONPATH="$ROOT/submodules/3dgs-pose:$ROOT/submodules/simple-knn:$ROOT"
   export OMP_NUM_THREADS=4 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
   export ED3DGS_ITERATIONS="$outer_iterations"
-  export ED3DGS_STRICT_STEP_BUDGET_V2=1
-  export ED3DGS_STRICT_CALIBRATION_STEPS="$calibration_steps"
-  export ED3DGS_STRICT_SCENE_STEPS="$scene_steps"
+  if [[ "$ARM" == "baseline" ]]; then
+    unset ED3DGS_STRICT_STEP_BUDGET_V2 ED3DGS_STRICT_CALIBRATION_STEPS \
+      ED3DGS_STRICT_SCENE_STEPS
+  else
+    export ED3DGS_STRICT_STEP_BUDGET_V2=1
+    export ED3DGS_STRICT_CALIBRATION_STEPS="$calibration_steps"
+    export ED3DGS_STRICT_SCENE_STEPS="$scene_steps"
+  fi
   export ED3DGS_THERMAL_FRAME_SHIFT="$EXPERIMENT_SHIFT"
   export ED3DGS_SELF_CALIBRATING_CLOCK_STUDY=1
   export ED3DGS_STRICT_COMMON_SUPPORT_V33=1 ED3DGS_R25_FOURARM="$ARM"
-  export ED3DGS_R25_DUAL_SUPPORT=1 ED3DGS_GEOFLOW_SOFTVOLUME_V1=1
-  export ED3DGS_BLOCK_CALIBRATION_V34=1
+  export ED3DGS_R25_DUAL_SUPPORT=1
+  if [[ "$ARM" == "pose_only" || "$ARM" == "baseline" ]]; then
+    unset ED3DGS_GEOFLOW_SOFTVOLUME_V1
+  else
+    export ED3DGS_GEOFLOW_SOFTVOLUME_V1=1
+  fi
+  if [[ "$ARM" == "baseline" ]]; then
+    unset ED3DGS_BLOCK_CALIBRATION_V34
+  else
+    export ED3DGS_BLOCK_CALIBRATION_V34=1
+  fi
   export ED3DGS_STRICT_SCENE_FREEZE_V1="$STRICT_SCENE_FREEZE"
   export ED3DGS_CAPACITY_ARM=modality_densify
   export ED3DGS_STAGE2_TEACHER_MODEL_PATH="$TEACHER"
-  export ED3DGS_JOINT_CLOCK_LOSS=1 ED3DGS_JOINT_CLOCK_LOSS_VARIANT=routed_ngf
-  export ED3DGS_ZERO_INIT_ROUTED_CLOCK_V1=1
-  export ED3DGS_TEMPORAL_CONSENSUS_V1=1 ED3DGS_TEMPORAL_CONSENSUS_MODE=consensus_only
   export ED3DGS_MODALITY_ROUTING_STABLE_V1=1
   export ED3DGS_EMA_MODAL_LOSS_V1=1 ED3DGS_CLOCK_FREEZE_AFTER_V1=15000
   export ED3DGS_MAX_GAUSSIANS=155000
@@ -174,6 +202,17 @@ configure_training() {
     ED3DGS_MATCHED_MOTION_CLOCK_STUDY ED3DGS_CLOCK_TOTAL_GRAD_V1 \
     ED3DGS_V34_JOINT_POSE_PERTURB ED3DGS_THERMAL_ENDPOINT_DRIFT_V34 \
     PYTHONOPTIMIZE
+  if [[ "$ARM" == "pose_only" || "$ARM" == "baseline" ]]; then
+    unset ED3DGS_JOINT_CLOCK_LOSS ED3DGS_JOINT_CLOCK_LOSS_VARIANT \
+      ED3DGS_ZERO_INIT_ROUTED_CLOCK_V1 ED3DGS_TEMPORAL_CONSENSUS_V1 \
+      ED3DGS_TEMPORAL_CONSENSUS_MODE ED3DGS_SELF_CALIBRATING_CLOCK_STUDY \
+      ED3DGS_CLOCK_FREEZE_AFTER_V1 ED3DGS_GEOFLOW_SOFTVOLUME_V1
+  else
+    export ED3DGS_JOINT_CLOCK_LOSS=1 ED3DGS_JOINT_CLOCK_LOSS_VARIANT=routed_ngf
+    export ED3DGS_ZERO_INIT_ROUTED_CLOCK_V1=1
+    export ED3DGS_TEMPORAL_CONSENSUS_V1=1 ED3DGS_TEMPORAL_CONSENSUS_MODE=consensus_only
+    export ED3DGS_SELF_CALIBRATING_CLOCK_STUDY=1
+  fi
   if [[ -n "$ABLATION_MODE" ]]; then
     export ED3DGS_SHIFT20_ABLATION_MODE="$ABLATION_MODE"
   else
@@ -188,18 +227,21 @@ configure_evaluation() {
   local calibration_steps=0
   local outer_iterations=30000
   if [[ "$scene_steps" != "0" ]]; then
-    calibration_steps=$(strict_calibration_steps "$scene_steps")
-    outer_iterations=$((scene_steps + calibration_steps))
+    calibration_steps=$(arm_calibration_steps "$scene_steps")
+    outer_iterations=$(arm_outer_iterations "$scene_steps")
   fi
   export CUDA_VISIBLE_DEVICES="$gpu"
   if [[ -n "${ED3DGS_CUDA_HOME:-}" ]]; then
     export CUDA_HOME="$ED3DGS_CUDA_HOME"
     export PATH="$CUDA_HOME/bin:$PATH"
   fi
-  export PYTHONPATH="$ROOT/submodules/3dgs-pose:$ROOT"
+  export PYTHONPATH="$ROOT/submodules/3dgs-pose:$ROOT/submodules/simple-knn:$ROOT"
   export OMP_NUM_THREADS=4 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
   export ED3DGS_ITERATIONS="$outer_iterations" ED3DGS_R25_FOURARM="$ARM"
-  if [[ "$scene_steps" != "0" ]]; then
+  if [[ "$ARM" == "baseline" ]]; then
+    unset ED3DGS_STRICT_SCENE_FREEZE_V1
+  fi
+  if [[ "$scene_steps" != "0" && "$ARM" != "baseline" ]]; then
     export ED3DGS_STRICT_STEP_BUDGET_V2=1
     export ED3DGS_STRICT_CALIBRATION_STEPS="$calibration_steps"
     export ED3DGS_STRICT_SCENE_STEPS="$scene_steps"
@@ -212,10 +254,6 @@ configure_evaluation() {
   export ED3DGS_R25_DUAL_SUPPORT=1 ED3DGS_GEOFLOW_SOFTVOLUME_V1=1
   export ED3DGS_CAPACITY_ARM=modality_densify
   export ED3DGS_STAGE2_TEACHER_MODEL_PATH="$TEACHER"
-  export ED3DGS_JOINT_CLOCK_LOSS=1 ED3DGS_JOINT_CLOCK_LOSS_VARIANT=routed_ngf
-  export ED3DGS_ZERO_INIT_ROUTED_CLOCK_V1=1
-  export ED3DGS_SELF_CALIBRATING_CLOCK_STUDY=1
-  export ED3DGS_TEMPORAL_CONSENSUS_V1=1 ED3DGS_TEMPORAL_CONSENSUS_MODE=consensus_only
   export ED3DGS_MODALITY_ROUTING_STABLE_V1=1
   export ED3DGS_EMA_MODAL_LOSS_V1=1 ED3DGS_CLOCK_FREEZE_AFTER_V1=15000
   export ED3DGS_MAX_GAUSSIANS=155000
@@ -234,6 +272,17 @@ configure_evaluation() {
     ED3DGS_CLOCK_REFINEMENT_GATE_REPORT \
     ED3DGS_CLOCK_REFINEMENT_OPTIMIZATION_REPORT \
     ED3DGS_CLOCK_REFINEMENT_COARSE_OFFSET PYTHONOPTIMIZE
+  if [[ "$ARM" == "pose_only" || "$ARM" == "baseline" ]]; then
+    unset ED3DGS_JOINT_CLOCK_LOSS ED3DGS_JOINT_CLOCK_LOSS_VARIANT \
+      ED3DGS_ZERO_INIT_ROUTED_CLOCK_V1 ED3DGS_TEMPORAL_CONSENSUS_V1 \
+      ED3DGS_TEMPORAL_CONSENSUS_MODE ED3DGS_SELF_CALIBRATING_CLOCK_STUDY \
+      ED3DGS_CLOCK_FREEZE_AFTER_V1 ED3DGS_GEOFLOW_SOFTVOLUME_V1
+  else
+    export ED3DGS_JOINT_CLOCK_LOSS=1 ED3DGS_JOINT_CLOCK_LOSS_VARIANT=routed_ngf
+    export ED3DGS_ZERO_INIT_ROUTED_CLOCK_V1=1
+    export ED3DGS_SELF_CALIBRATING_CLOCK_STUDY=1
+    export ED3DGS_TEMPORAL_CONSENSUS_V1=1 ED3DGS_TEMPORAL_CONSENSUS_MODE=consensus_only
+  fi
   if [[ -n "$ABLATION_MODE" ]]; then
     export ED3DGS_SHIFT20_ABLATION_MODE="$ABLATION_MODE"
   else
@@ -245,7 +294,7 @@ configure_teacher() {
   local gpu=$1
   export CUDA_VISIBLE_DEVICES="$gpu"
   export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:128
-  export PYTHONPATH="$ROOT/submodules/3dgs-pose:$ROOT"
+  export PYTHONPATH="$ROOT/submodules/3dgs-pose:$ROOT/submodules/simple-knn:$ROOT"
   export OMP_NUM_THREADS=4 PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
   export ED3DGS_ITERATIONS=30000 ED3DGS_THERMAL_FRAME_SHIFT=0
   export ED3DGS_MAX_GAUSSIANS=155000
@@ -358,8 +407,8 @@ run_gate() {
   mkdir -p "$(dirname "$output")" "$(dirname "$log")"
   local calibration_steps
   local outer_iterations
-  calibration_steps=$(strict_calibration_steps "$GATE_ITERATIONS")
-  outer_iterations=$((GATE_ITERATIONS + calibration_steps))
+  calibration_steps=$(arm_calibration_steps "$GATE_ITERATIONS")
+  outer_iterations=$(arm_outer_iterations "$GATE_ITERATIONS")
   configure_training "$gpu" "$GATE_ITERATIONS"
   cd "$ROOT"
   printf '%s\n' 'A5000_FASTPATH_CONFIG {"deformation_checkpoint": false, "memory_safe_backward": false}' | tee "$log"
@@ -374,10 +423,15 @@ run_gate() {
   if [[ "$STRICT_SCENE_FREEZE" == "1" ]]; then
     strict_args=(--strict-scene-freeze)
   fi
+  local budget_args=()
+  if [[ "$ARM" != "baseline" ]]; then
+    budget_args=(--calibration-steps "$calibration_steps" \
+      --scene-steps "$GATE_ITERATIONS")
+  fi
   "$PYTHON" -m time_alignment.gate_audit --output "$output" --log "$log" \
     --arm "$ARM" \
     --expected-shift "$EXPERIMENT_SHIFT" --expected-iterations "$outer_iterations" \
-    --calibration-steps "$calibration_steps" --scene-steps "$GATE_ITERATIONS" \
+    "${budget_args[@]}" \
     --support-contract "$SUPPORT_CONTRACT" "${baseline_args[@]}" \
     "${strict_args[@]}"
   touch "$output/RUN_COMPLETE"
@@ -397,8 +451,8 @@ run_smoke() {
   mkdir -p "$(dirname "$output")" "$(dirname "$log")"
   local calibration_steps
   local outer_iterations
-  calibration_steps=$(strict_calibration_steps 64)
-  outer_iterations=$((64 + calibration_steps))
+  calibration_steps=$(arm_calibration_steps 64)
+  outer_iterations=$(arm_outer_iterations 64)
   configure_training "$gpu" 64
   cd "$ROOT"
   printf '%s\n' 'A5000_FASTPATH_CONFIG {"deformation_checkpoint": false, "memory_safe_backward": false}' | tee "$log"
@@ -409,10 +463,14 @@ run_smoke() {
   if [[ "$STRICT_SCENE_FREEZE" == "1" ]]; then
     strict_args=(--strict-scene-freeze)
   fi
+  local budget_args=()
+  if [[ "$ARM" != "baseline" ]]; then
+    budget_args=(--calibration-steps "$calibration_steps" --scene-steps 64)
+  fi
   "$PYTHON" -m time_alignment.gate_audit --output "$output" --log "$log" \
     --arm "$ARM" \
     --expected-shift "$EXPERIMENT_SHIFT" --expected-iterations "$outer_iterations" \
-    --calibration-steps "$calibration_steps" --scene-steps 64 \
+    "${budget_args[@]}" \
     --support-contract "$SUPPORT_CONTRACT" --mechanical \
     "${strict_args[@]}"
   touch "$output/RUN_COMPLETE"
@@ -442,8 +500,8 @@ PY
   mkdir -p "$(dirname "$output")" "$(dirname "$log")"
   local calibration_steps
   local outer_iterations
-  calibration_steps=$(strict_calibration_steps 30000)
-  outer_iterations=$((30000 + calibration_steps))
+  calibration_steps=$(arm_calibration_steps 30000)
+  outer_iterations=$(arm_outer_iterations 30000)
   configure_training "$gpu" 30000
   cd "$ROOT"
   printf '%s\n' 'A5000_FASTPATH_CONFIG {"deformation_checkpoint": false, "memory_safe_backward": false}' | tee "$launcher_log"
@@ -451,6 +509,29 @@ PY
   "$PYTHON" train.py -s "$DATASET" -m "$output" -r 2 \
     --configs "$CONFIG" --seed "$seed" --save_iterations "$outer_iterations" \
     --checkpoint_iterations "$outer_iterations" 2>&1 | tee -a "$log"
+  finalize_training "$gpu" "$seed"
+}
+
+finalize_training() {
+  local gpu=$1 seed=$2
+  local output="$RUN_ROOT/$SCENE/seed_${seed}"
+  local log="$RUN_ROOT/$SCENE/logs/training_seed_${seed}.log"
+  local launcher_log="$RUN_ROOT/$SCENE/logs/training_seed_${seed}.launcher.log"
+  local gate="$RUN_ROOT/$SCENE/gates/seed_${seed}/gate_audit.json"
+  local calibration_steps outer_iterations
+  calibration_steps=$(arm_calibration_steps 30000)
+  outer_iterations=$(arm_outer_iterations 30000)
+  [[ ! -e "$output/RUN_COMPLETE" && ! -e "$output/training_audit.json" ]] || {
+    echo "Refusing already finalized/audited model: $output" >&2; exit 6;
+  }
+  "$PYTHON" - "$gate" <<'PY'
+import json, sys
+report = json.load(open(sys.argv[1]))
+if report.get('status') != 'PASS' or not report.get('checks') or not all(report['checks'].values()):
+    raise SystemExit('Gate audit failed')
+PY
+  configure_training "$gpu" 30000
+  cd "$ROOT"
   local baseline_args=()
   if [[ -n "$BASELINE_GATE" ]]; then
     baseline_args=(--baseline-gate "$BASELINE_GATE")
@@ -459,17 +540,28 @@ PY
   if [[ "$STRICT_SCENE_FREEZE" == "1" ]]; then
     strict_args=(--strict-scene-freeze)
   fi
+  local budget_args=()
+  if [[ "$ARM" != "baseline" ]]; then
+    budget_args=(--calibration-steps "$calibration_steps" --scene-steps 30000)
+  fi
   "$PYTHON" -m time_alignment.training_audit \
     --output "$output" --log "$log" --launcher-log "$launcher_log" \
     --arm "$ARM" \
     --expected-shift "$EXPERIMENT_SHIFT" --expected-iterations "$outer_iterations" \
-    --calibration-steps "$calibration_steps" --scene-steps 30000 \
+    "${budget_args[@]}" \
     --support-contract "$SUPPORT_CONTRACT" \
-    "${baseline_args[@]}" "${strict_args[@]}"
+    "${baseline_args[@]}" "${strict_args[@]}" \
+    ${ED3DGS_LEGACY_FREEZE_STATUS_RECORDS:+--legacy-freeze-status-records}
   mv "$output/chkpnt${outer_iterations}.pth" "$output/checkpoint.pth"
   mv "$output/stage2_training_result.json" "$output/training_result.json"
   mv "$output/stage2_teacher_init.json" "$output/teacher_initialization.json"
-  mv "$output/train_change_temporal_offset.json" "$output/learned_clock.json"
+  if [[ "$ARM" == "pose_only" || "$ARM" == "baseline" ]]; then
+    [[ ! -e "$output/train_change_temporal_offset.json" ]] || {
+      echo "Unexpected clock state in pose_only" >&2; exit 7;
+    }
+  else
+    mv "$output/train_change_temporal_offset.json" "$output/learned_clock.json"
+  fi
   touch "$output/RUN_COMPLETE"
   echo "TRAINING_COMPLETE seed=$seed output=$output"
 }
@@ -482,8 +574,8 @@ run_evaluation() {
   if [[ "$model_arg" = /* ]]; then model="$model_arg"; else model="$ROOT/$model_arg"; fi
   local calibration_steps
   local outer_iterations
-  calibration_steps=$(strict_calibration_steps 30000)
-  outer_iterations=$((30000 + calibration_steps))
+  calibration_steps=$(arm_calibration_steps 30000)
+  outer_iterations=$(arm_outer_iterations 30000)
   for path in "$model/RUN_COMPLETE" "$model/training_audit.json" \
     "$model/point_cloud/iteration_${outer_iterations}/point_cloud.ply" \
     "$model/point_cloud/iteration_${outer_iterations}/deformation.pth" \
@@ -541,10 +633,14 @@ PY
   if [[ "$STRICT_SCENE_FREEZE" == "1" ]]; then
     strict_args=(--strict-scene-freeze)
   fi
+  local budget_args=()
+  if [[ "$ARM" != "baseline" ]]; then
+    budget_args=(--calibration-steps "$calibration_steps" --scene-steps 30000)
+  fi
   "$PYTHON" -m time_alignment.evaluation_audit --arm "$ARM" \
     --eval-root "$evaluation" --model-manifest "$evaluation/model_inputs.sha256" \
     --expected-shift "$EXPERIMENT_SHIFT" --expected-iteration "$outer_iterations" \
-    --calibration-steps "$calibration_steps" --scene-steps 30000 \
+    "${budget_args[@]}" \
     --support-contract "$SUPPORT_CONTRACT" \
     "${baseline_args[@]}" "${strict_args[@]}"
   touch "$evaluation/EVAL_COMPLETE"
@@ -578,9 +674,9 @@ run_lifecycle() {
 
 case "$ACTION" in
   help|--help|-h)
-    echo "usage: run.sh {teacher|smoke|gate|train|evaluate|lifecycle|verify} [GPU] [SEED] [MODEL_PATH]"
+    echo "usage: run.sh {teacher|smoke|gate|train|finalize|evaluate|lifecycle|verify} [GPU] [SEED] [MODEL_PATH]"
     ;;
-  teacher|smoke|gate|train|evaluate|lifecycle)
+  teacher|smoke|gate|train|finalize|evaluate|lifecycle)
     GPU=${2:?usage: run.sh $ACTION GPU SEED [MODEL_PATH]}
     SEED=${3:?usage: run.sh $ACTION GPU SEED [MODEL_PATH]}
     require_python
@@ -617,6 +713,7 @@ case "$ACTION" in
     if [[ "$ACTION" == smoke ]]; then run_smoke "$GPU" "$SEED"; fi
     if [[ "$ACTION" == gate ]]; then run_gate "$GPU" "$SEED"; fi
     if [[ "$ACTION" == train ]]; then run_training "$GPU" "$SEED"; fi
+    if [[ "$ACTION" == finalize ]]; then finalize_training "$GPU" "$SEED"; fi
     if [[ "$ACTION" == evaluate ]]; then run_evaluation "$GPU" "$SEED" "${4:-}"; fi
     if [[ "$ACTION" == lifecycle ]]; then run_lifecycle "$GPU" "$SEED"; fi
     ;;
@@ -625,7 +722,7 @@ case "$ACTION" in
     "$PYTHON" -m time_alignment.release_audit
     ;;
   *)
-    echo "usage: run.sh {teacher|smoke|gate|train|evaluate|lifecycle|verify} [GPU] [SEED] [MODEL_PATH]" >&2
+    echo "usage: run.sh {teacher|smoke|gate|train|finalize|evaluate|lifecycle|verify} [GPU] [SEED] [MODEL_PATH]" >&2
     exit 2
     ;;
 esac

@@ -656,20 +656,21 @@ class multiemb_thermal_deform_network(nn.Module):
     def deform(self, hidden, pts, scales, rotations, opacity, sh_coefs,
                 pos_deform, scales_deform, rotations_deform, opacity_deform, rgb_deform,
                   scale=1., scale_c=1., scale_o=1., coef_s=1.):
-        dx, ds, dr, do = pos_deform(hidden), None, None, None
+        hidden = F.relu(hidden)
+        dx, ds, dr, do = pos_deform[1:](hidden), None, None, None
         pts = pts + dx * scale
         
         if not self.args.no_ds:
-            ds = scales_deform(hidden)
+            ds = scales_deform[1:](hidden)
             scales = scales + ds * scale * coef_s
         if not self.args.no_dr:
-            dr = rotations_deform(hidden)
+            dr = rotations_deform[1:](hidden)
             rotations = rotations + dr * scale
         if not self.args.no_do:
-            do = opacity_deform(hidden) 
+            do = opacity_deform[1:](hidden)
             opacity = opacity + do * scale * scale_o
         if not self.args.no_dc:
-            dc = rgb_deform(hidden) 
+            dc = rgb_deform[1:](hidden)
             sh_coefs = sh_coefs + dc.view(-1,16,3) * scale_c
         return pts, scales, rotations, opacity, sh_coefs
 
@@ -680,9 +681,10 @@ class multiemb_thermal_deform_network(nn.Module):
         # Geometric deformation for thermal:
         # - When thermal_only=True: always deform geometry (thermal drives everything)
         # - When change_thermal_geo=True: thermal adds residual geometry on top of RGB
+        hidden = F.relu(hidden)
         deform_geo = thermal_only or self.args.change_thermal_geo
         if deform_geo:
-            dx_th = _run_deformation_head(pos_deform, hidden)
+            dx_th = _run_deformation_head(pos_deform[1:], hidden)
             if thermal_only:
                 pts = pts + dx_th * scale
             else:
@@ -690,17 +692,17 @@ class multiemb_thermal_deform_network(nn.Module):
                 pts = pts + dx * scale
 
             if not self.args.no_ds:
-                ds = _run_deformation_head(scales_deform, hidden)
+                ds = _run_deformation_head(scales_deform[1:], hidden)
                 scales = scales + ds * scale * coef_s
             if not self.args.no_dr:
-                dr = _run_deformation_head(rotations_deform, hidden)
+                dr = _run_deformation_head(rotations_deform[1:], hidden)
                 rotations = rotations + dr * scale
 
         if not self.args.no_do:
-            thermal_do = _run_deformation_head(thermal_opacity_deform, hidden)
+            thermal_do = _run_deformation_head(thermal_opacity_deform[1:], hidden)
             thermal_opacity = thermal_opacity + thermal_do * scale * scale_o
         if not self.args.no_dc:
-            thermal_dc = _run_deformation_head(thermal_deform, hidden)
+            thermal_dc = _run_deformation_head(thermal_deform[1:], hidden)
             thermal_sh_coefs = thermal_sh_coefs + thermal_dc.view(-1,16,3) * scale_c
         return pts, scales, rotations, thermal_opacity, thermal_sh_coefs
 

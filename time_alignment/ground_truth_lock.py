@@ -59,7 +59,10 @@ def main():
             rf"boundary_identity={boundary}", log):
         raise RuntimeError("GT-lock loader shift contract mismatch")
 
-    base = args.eval_root / "test" / "ours_30000"
+    method = contract.get("method")
+    if not isinstance(method, str) or not re.fullmatch(r"ours_[0-9]+", method):
+        raise RuntimeError("Invalid render method in GT-lock contract")
+    base = args.eval_root / "test" / method
     rgb_count, rgb_digest = image_manifest(base / "test_rgb" / "gt")
     thermal_count, thermal_digest = image_manifest(base / "test_thermal" / "gt")
     if rgb_count != support_count or thermal_count != support_count:

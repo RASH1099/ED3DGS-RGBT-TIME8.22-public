@@ -12,3 +12,4 @@ outputs/*
 !outputs/.gitkeep
 build/
 *.egg-info/
+*.so

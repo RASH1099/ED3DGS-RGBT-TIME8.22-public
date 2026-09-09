@@ -446,6 +446,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             os.environ.get("ED3DGS_STRICT_STEP_BUDGET_V2", "0") == "1")
     clock_target_steps = int(getattr(
         opt, "temporal_offset_target_steps", -1))
+    if fixed_clock_ablation:
+        clock_target_steps = 0
     pose_target_steps = int(getattr(
         opt, "thermal_pose_target_steps", -1))
     geoflow_clock = (
@@ -543,6 +545,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         opt, "strict_calibration_steps", -1))
     clock_target_steps = int(getattr(
         opt, "temporal_offset_target_steps", -1))
+    if fixed_clock_ablation:
+        clock_target_steps = 0
     pose_target_steps = int(getattr(
         opt, "thermal_pose_target_steps", -1))
     if strict_step_budget_v2 and not strict_scene_freeze:
@@ -744,7 +748,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
     viewpoint_stack = train_cams
     reconstruction_support_configured = False
-    if zero_init_routed_clock or fixed_clock_ablation:
+    baseline_arm = fourarm == "baseline"
+    if zero_init_routed_clock or fixed_clock_ablation or baseline_arm:
         support_contract_path = os.environ.get(
             "ED3DGS_RECONSTRUCTION_SUPPORT_CONTRACT", "")
         if not support_contract_path:
@@ -767,6 +772,23 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 expected_reconstruction_count,
             "ablation_mode": ablation_mode or None,
         }, sort_keys=True))
+        if baseline_arm and not reconstruction_support_configured:
+            support_report = configure_fixed_clock_reconstruction_support(scene)
+            train_cams = list(scene.stage2_reconstruction_cameras)
+            if dataset.loader != "nerfies":
+                train_cams = sorted(
+                    train_cams,
+                    key=lambda camera: (camera.cam_no, camera.frame_no))
+            viewpoint_stack = train_cams
+            reconstruction_support_configured = True
+            print("STAGE2_RECONSTRUCTION_SUPPORT_SWITCH " + json.dumps({
+                "iteration": 0,
+                "calibration_camera_count": len(
+                    scene.stage2_training_cameras),
+                "reconstruction_camera_count": len(train_cams),
+                "fixed_offset_frames": 0.0,
+                "ablation_mode": None,
+            }, sort_keys=True))
     method = None
 
     temporal_consensus = None
@@ -1355,9 +1377,8 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
         iter_start.record()
 
         if strict_step_budget_v2:
-            support_switch_iteration = (
-                calibration_reconstruction_start_iter
-                + 2 * strict_calibration_steps)
+            support_switch_iteration = schedule.support_switch_iteration(
+                strict_calibration_steps, calibration_reconstruction_start_iter)
             clock_step_candidate = temporal_offset_optimizer_step_count + 1
             pose_step_candidate = thermal_pose_optimizer_step_count + 1
         else:
@@ -1425,7 +1446,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
         if (fixed_clock_ablation
                 and not reconstruction_support_configured
-                and iteration == 15001):
+                and iteration == support_switch_iteration):
             support_report = configure_fixed_clock_reconstruction_support(scene)
             if support_report is None:
                 raise RuntimeError(
@@ -1618,12 +1639,21 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
 
             # 渲染 RGB 与 Thermal 两种模态
 
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background, background_thermal,
-                               cam_no=cam_no, iter=scene_forward_step,
-                               num_down_emb_c=hyper.min_embeddings, num_down_emb_f=hyper.min_embeddings,
-                               modality_routing=s_hard, modality_tau=opt.modality_tau, modality_stage=routing_stage,
-                               thermal_only=opt.thermal_only,
-                               rgb_only_teacher=opt.rgb_only_teacher)
+            # A frozen-pose clock step only differentiates the cached clock
+            # objective. Keep rendering for EMA/sampling, without a render graph.
+            clock_only_render = (
+                strict_scene_freeze and frozen_pose_ablation
+                and optimizer_phase == "calibration" and not step_scene_optimizer
+                and not scene.has_thermal_pose and opt.thermal_intrinsic_lr == 0
+                and temporal_consensus_enabled
+                and temporal_consensus_mode == "consensus_only")
+            with torch.set_grad_enabled(torch.is_grad_enabled() and not clock_only_render):
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background, background_thermal,
+                                   cam_no=cam_no, iter=scene_forward_step,
+                                   num_down_emb_c=hyper.min_embeddings, num_down_emb_f=hyper.min_embeddings,
+                                   modality_routing=s_hard, modality_tau=opt.modality_tau, modality_stage=routing_stage,
+                                   thermal_only=opt.thermal_only,
+                                   rgb_only_teacher=opt.rgb_only_teacher)
             if bool(render_pkg.get("rgb_only_teacher", False)) != bool(opt.rgb_only_teacher):
                 raise RuntimeError("renderer RGB-only contract mismatch")
 
@@ -1853,10 +1883,14 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                 (clock_loss_iteration - joint_clock_loss_start_iter + 1)
                 / joint_clock_loss_ramp_iters)
             joint_clock_weight = joint_clock_loss_weight * ramp_progress
-            spatial_alignment_loss, spatial_components = (
-                clock_loss.batch_image_loss(
-                    image_tensor_thermal, gt_image_tensor_thermal))
-            joint_clock_components.update(spatial_components)
+            # consensus_only optimizes the cached temporal objective. Spatial
+            # image diagnostics do not contribute to its loss or gradients.
+            if not (temporal_consensus_enabled
+                    and temporal_consensus_mode == "consensus_only"):
+                spatial_alignment_loss, spatial_components = (
+                    clock_loss.batch_image_loss(
+                        image_tensor_thermal, gt_image_tensor_thermal))
+                joint_clock_components.update(spatial_components)
             if temporal_consensus_enabled:
                 if self_calibrating_clock:
                     consensus_loss, consensus_sides = temporal_consensus.loss(
@@ -1909,13 +1943,15 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                     "joint_clock/weight", joint_clock_weight, iteration)
                 tb_writer.add_scalar(
                     "joint_clock/loss", joint_clock_alignment_loss.item(), iteration)
-                tb_writer.add_scalar(
-                    "joint_clock/mind", joint_clock_components["mind"].item(), iteration)
-                tb_writer.add_scalar(
-                    "joint_clock/ngf", joint_clock_components["ngf"].item(), iteration)
-                tb_writer.add_scalar(
-                    "joint_clock/routed_ngf",
-                    joint_clock_components["routed_ngf"].item(), iteration)
+                if not (temporal_consensus_enabled
+                        and temporal_consensus_mode == "consensus_only"):
+                    tb_writer.add_scalar(
+                        "joint_clock/mind", joint_clock_components["mind"].item(), iteration)
+                    tb_writer.add_scalar(
+                        "joint_clock/ngf", joint_clock_components["ngf"].item(), iteration)
+                    tb_writer.add_scalar(
+                        "joint_clock/routed_ngf",
+                        joint_clock_components["routed_ngf"].item(), iteration)
                 if temporal_consensus_enabled:
                     tb_writer.add_scalar(
                         "joint_clock/temporal_consensus",
@@ -2670,6 +2706,7 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
                             f"offset_frames={scene.temporal_offset_frames().detach().item():.6f}"
                         )
                     if (strict_step_budget_v2
+                            and train_temporal_offset
                             and clock_target_steps > 0
                             and temporal_offset_optimizer_step_count == clock_target_steps):
                         print("STRICT_CLOCK_FREEZE " + json.dumps({
@@ -3363,9 +3400,10 @@ def training(dataset, hyper, opt, pipe, testing_iterations, saving_iterations, c
                 raise RuntimeError(
                     f"Fixed-clock calibration side is invalid: {camera.image_name}")
             side_counts[side] += 1
-        if len(selected) != 218 or side_counts != {"left": 109, "right": 109}:
+        if (not selected or len(selected) % 2 != 0
+                or side_counts["left"] != side_counts["right"]):
             raise RuntimeError(
-                "Fixed-clock calibration support must be 218/109+109")
+                "Fixed-clock calibration support must be balanced by side")
         selected_names = [camera.image_name for camera in selected]
         scene.stage2_reconstruction_cameras = selected
         scene.stage2_reconstruction_support_report = {
